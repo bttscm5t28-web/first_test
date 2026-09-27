@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>VLA in 2 Minutes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;700;900&display=block" rel="stylesheet">
+<style>
+  html, body { margin: 0; background: #0B0B10; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Deterministic 2-minute VLA explainer. render(t) draws the frame at time t (seconds).
+const W = 1920, H = 1080, DURATION = 120;
+window.DURATION = DURATION;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+const C = {
+  bg: '#0B0B10', fg: '#F4F1EA', dim: '#7A7A88', faint: '#2A2A35', line: '#1C1C25', card: '#13131A',
+  V: '#35D0BA', L: '#8C7BFF', A: '#FF9F43', hi: '#FFD23F',
+  cup: '#F0484E', plate: '#4C8DFF', block: '#4FB86A', arm: '#CFCBC2',
+};
+const SANS = '"Noto Sans SC", "Inter", sans-serif';
+const LATIN = '"Inter", "Noto Sans SC", sans-serif';
+const MONO = '"JetBrains Mono", "Noto Sans SC", monospace';
+
+// ---------- helpers ----------
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const prog = (t, s, e) => clamp((t - s) / (e - s));
+const eio = x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const eout = x => 1 - Math.pow(1 - x, 3);
+const eback = x => { if (x <= 0) return 0; const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+const lerp = (a, b, k) => a + (b - a) * k;
+const rnd = i => { const s = Math.sin(i * 12.9898 + 78.233) * 43758.5453; return s - Math.floor(s); };
+const fade = (lt, s, e, f = 0.4) => Math.min(prog(lt, s, s + f), 1 - prog(lt, e - f, e));
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`;
+}
+function mix(h1, h2, k) {
+  const p = h => { const n = parseInt(h.slice(1), 16); return [n >> 16, (n >> 8) & 255, n & 255]; };
+  const a = p(h1), b = p(h2);
+  return '#' + a.map((v, i) => Math.round(lerp(v, b[i], k)).toString(16).padStart(2, '0')).join('');
+}
+
+let A = 1; // alpha of the current scene
+const al = x => { ctx.globalAlpha = clamp(A * x); };
+
+const seen = new Set(); // every string drawn (used to preload font subsets)
+function text(str, x, y, o = {}) {
+  seen.add(str);
+  const { size = 32, weight = 400, color = C.fg, align = 'left', font = SANS, alpha = 1, base = 'alphabetic', ls = 0 } = o;
+  if (alpha <= 0) return;
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = base;
+  ctx.letterSpacing = ls + 'px';
+  al(alpha);
+  ctx.fillText(str, x, y);
+  ctx.letterSpacing = '0px';
+}
+function mw(str, size, weight = 400, font = SANS) {
+  seen.add(str);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.letterSpacing = '0px';
+  return ctx.measureText(str).width;
+}
+function rrect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function box(x, y, w, h, o = {}) {
+  const { fill = C.card, stroke = C.faint, r = 16, alpha = 1, lw = 2 } = o;
+  if (alpha <= 0) return;
+  rrect(x, y, w, h, r);
+  al(alpha);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.lineWidth = lw; ctx.strokeStyle = stroke; ctx.stroke(); }
+}
+function line(x0, y0, x1, y1, o = {}) {
+  const { color = C.dim, lw = 3, alpha = 1, p = 1, head = true, dash = null } = o;
+  if (p <= 0 || alpha <= 0) return;
+  const x = lerp(x0, x1, p), y = lerp(y0, y1, p);
+  al(alpha);
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (dash) ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x, y); ctx.stroke();
+  ctx.setLineDash([]);
+  if (head && p > 0.98) {
+    const a = Math.atan2(y1 - y0, x1 - x0), s = 12 + lw;
+    ctx.beginPath();
+    ctx.moveTo(x - Math.cos(a - 0.5) * s, y - Math.sin(a - 0.5) * s);
+    ctx.lineTo(x, y);
+    ctx.lineTo(x - Math.cos(a + 0.5) * s, y - Math.sin(a + 0.5) * s);
+    ctx.stroke();
+  }
+}
+// polyline drawn up to progress p (0..1 of total length), arrow head at the end
+function poly(pts, o = {}) {
+  const { color = C.dim, lw = 3, alpha = 1, p = 1, head = true } = o;
+  if (p <= 0) return;
+  const seg = []; let tot = 0;
+  for (let i = 1; i < pts.length; i++) { const l = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); seg.push(l); tot += l; }
+  let rem = tot * p;
+  al(alpha);
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(...pts[0]);
+  let last = pts[0], prev = pts[0];
+  for (let i = 1; i < pts.length && rem > 0; i++) {
+    const k = Math.min(1, rem / seg[i - 1]);
+    prev = pts[i - 1];
+    last = [lerp(pts[i - 1][0], pts[i][0], k), lerp(pts[i - 1][1], pts[i][1], k)];
+    ctx.lineTo(...last);
+    rem -= seg[i - 1];
+  }
+  ctx.stroke();
+  if (head && p > 0.98) {
+    const a = Math.atan2(last[1] - prev[1], last[0] - prev[0]), s = 12 + lw;
+    ctx.beginPath();
+    ctx.moveTo(last[0] - Math.cos(a - 0.5) * s, last[1] - Math.sin(a - 0.5) * s);
+    ctx.lineTo(...last);
+    ctx.lineTo(last[0] - Math.cos(a + 0.5) * s, last[1] - Math.sin(a + 0.5) * s);
+    ctx.stroke();
+  }
+}
+function sq(x, y, s, color, alpha = 1, r = 6) {
+  if (alpha <= 0) return;
+  rrect(x, y, s, s, r); ctx.fillStyle = color; al(alpha); ctx.fill();
+}
+// word token pill; returns width
+function pill(str, x, y, o = {}) {
+  const { size = 26, color = C.L, alpha = 1, h = 48, pad = 16, solid = false, weight = 600, font = SANS, textColor } = o;
+  const w = mw(str, size, weight, font) + pad * 2;
+  if (alpha > 0) {
+    box(x, y, w, h, { fill: solid ? color : hexA(color, 0.14), stroke: color, r: 12, alpha });
+    text(str, x + w / 2, y + h / 2 + 1, { size, weight, font, align: 'center', base: 'middle', color: textColor || (solid ? C.bg : C.fg), alpha });
+  }
+  return w;
+}
+
+// ---------- shared chrome ----------
+function headline(title, lt) {
+  const k = eout(prog(lt, 0.05, 0.7));
+  text(title, 120, 240 + (1 - k) * 24, { size: 64, weight: 900, alpha: k });
+}
+function captions(lt, list) {
+  for (const [s, e, str] of list) {
+    const k = fade(lt, s, e, 0.35);
+    if (k > 0) text(str, W / 2, 986 + (1 - eout(prog(lt, s, s + 0.4))) * 10, { size: 34, weight: 500, align: 'center', alpha: k });
+  }
+}
+
+// ---------- the tabletop world (shared across scenes) ----------
+// local coords: 1000 × 600. Table top at y=470.
+const REST = { g: [520, 240], open: 1 };
+function armIK(g, open) {
+  const [gx, gy] = g;
+  const spread = lerp(64, 100, open);
+  const palmY = gy - 45, Wp = [gx, palmY - 35], S = [90, 330], L = 305;
+  const dx = Wp[0] - S[0], dy = Wp[1] - S[1];
+  const d = Math.min(Math.hypot(dx, dy), 2 * L - 1);
+  const a = Math.atan2(dy, dx), b = Math.acos(d / (2 * L));
+  const e1 = [S[0] + L * Math.cos(a - b), S[1] + L * Math.sin(a - b)];
+  const e2 = [S[0] + L * Math.cos(a + b), S[1] + L * Math.sin(a + b)];
+  const E = e1[1] < e2[1] ? e1 : e2;
+  return { S, E, Wp, palmY, spread, gx, gy };
+}
+function drawArm(g, open) {
+  const { S, E, Wp, palmY, spread, gx, gy } = armIK(g, open);
+  ctx.fillStyle = '#2C2C38';
+  ctx.fillRect(70, 330, 40, 140);
+  ctx.fillRect(40, 452, 100, 18);
+  ctx.strokeStyle = C.arm; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.lineWidth = 22;
+  ctx.beginPath(); ctx.moveTo(...S); ctx.lineTo(...E); ctx.lineTo(...Wp); ctx.stroke();
+  ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.moveTo(...Wp); ctx.lineTo(gx, palmY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(gx - spread / 2 - 4, palmY); ctx.lineTo(gx + spread / 2 + 4, palmY); ctx.stroke();
+  ctx.lineWidth = 10;
+  ctx.beginPath();
+  ctx.moveTo(gx - spread / 2, palmY); ctx.lineTo(gx - spread / 2, gy);
+  ctx.moveTo(gx + spread / 2, palmY); ctx.lineTo(gx + spread / 2, gy);
+  ctx.stroke();
+  for (const p of [S, E, Wp]) {
+    ctx.beginPath(); ctx.arc(...p, 13, 0, 7);
+    ctx.fillStyle = C.bg; ctx.fill(); ctx.lineWidth = 5; ctx.stroke();
+  }
+}
+function drawCup(cx, cy) {
+  ctx.fillStyle = C.cup;
+  ctx.beginPath();
+  ctx.moveTo(cx - 27, cy); ctx.lineTo(cx + 27, cy); ctx.lineTo(cx + 34, cy - 90); ctx.lineTo(cx - 34, cy - 90);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = C.cup; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.arc(cx + 36, cy - 50, 17, -Math.PI / 2, Math.PI / 2); ctx.stroke();
+  ctx.fillStyle = '#FF8589';
+  ctx.beginPath(); ctx.ellipse(cx, cy - 90, 34, 6, 0, 0, 7); ctx.fill();
+}
+function world(x, y, w, st = {}, alpha = 1) {
+  if (alpha <= 0) return;
+  const s = w / 1000, h = 600 * s;
+  ctx.save();
+  rrect(x, y, w, h, 16);
+  al(alpha);
+  ctx.fillStyle = '#101017'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = C.faint; ctx.stroke();
+  ctx.clip();
+  ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = '#17171F'; ctx.fillRect(0, 470, 1000, 130);
+  ctx.fillStyle = '#2A2A36'; ctx.fillRect(0, 468, 1000, 4);
+  ctx.fillStyle = C.plate;
+  ctx.beginPath(); ctx.ellipse(680, 464, 100, 13, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#86B4FF';
+  ctx.beginPath(); ctx.ellipse(680, 460, 78, 7, 0, 0, 7); ctx.fill();
+  if (st.block !== false) { ctx.fillStyle = C.block; ctx.beginPath(); ctx.roundRect(502, 418, 52, 52, 6); ctx.fill(); }
+  const cup = st.cup || [400, 470];
+  drawCup(...cup);
+  if (st.arm !== false) drawArm(st.g || REST.g, st.open ?? REST.open);
+  if (st.extra) st.extra();
+  ctx.restore();
+}
+// keyframed arm motion: [time, gx, gy, open]
+function traj(T, kf) {
+  if (T <= kf[0][0]) return { g: [kf[0][1], kf[0][2]], open: kf[0][3] };
+  for (let i = 1; i < kf.length; i++) {
+    if (T <= kf[i][0]) {
+      const a = kf[i - 1], b = kf[i], k = eio((T - a[0]) / (b[0] - a[0]));
+      return { g: [lerp(a[1], b[1], k), lerp(a[2], b[2], k)], open: lerp(a[3], b[3], k) };
+    }
+  }
+  const z = kf[kf.length - 1];
+  return { g: [z[1], z[2]], open: z[3] };
+}
+
+// ---------- background (static) ----------
+const bgc = document.createElement('canvas');
+bgc.width = W; bgc.height = H;
+(() => {
+  const g = bgc.getContext('2d');
+  g.fillStyle = C.bg; g.fillRect(0, 0, W, H);
+  g.fillStyle = '#18181F';
+  for (let x = 48; x < W; x += 48) for (let y = 48; y < H; y += 48) { g.beginPath(); g.arc(x, y, 1.3, 0, 7); g.fill(); }
+  const v = g.createRadialGradient(W / 2, H / 2, 200, W / 2, H / 2, 1200);
+  v.addColorStop(0, 'rgba(11,11,16,0)'); v.addColorStop(1, 'rgba(5,5,8,0.85)');
+  g.fillStyle = v; g.fillRect(0, 0, W, H);
+})();
+
+// ================= SCENES =================
+
+// 0 · Title
+function sTitle(lt) {
+  const letters = [['V', C.V, 'Vision', '视觉'], ['L', C.L, 'Language', '语言'], ['A', C.A, 'Action', '动作']];
+  const gap = 260, x0 = W / 2 - gap;
+  letters.forEach(([ch, col, en, zh], i) => {
+    const x = x0 + i * gap;
+    const k = eout(prog(lt, 0.3 + i * 0.35, 1.1 + i * 0.35));
+    text(ch, x, 520 + (1 - k) * 50, { size: 240, weight: 800, font: LATIN, align: 'center', color: col, alpha: k });
+    const k2 = eout(prog(lt, 0.8 + i * 0.35, 1.5 + i * 0.35));
+    text(en, x, 600, { size: 26, font: MONO, align: 'center', color: C.dim, alpha: k2, ls: 3 });
+    text(zh, x, 648, { size: 34, weight: 700, align: 'center', color: C.fg, alpha: k2 });
+  });
+  const k3 = eout(prog(lt, 2.4, 3.1));
+  text('视觉-语言-动作模型', W / 2, 770 + (1 - k3) * 16, { size: 46, weight: 700, align: 'center', alpha: k3 });
+  const k4 = eout(prog(lt, 3.0, 3.7));
+  text('让大模型从「会说」，走向「会做」', W / 2, 840, { size: 34, align: 'center', color: C.dim, alpha: k4 });
+}
+
+// 1 · Problem
+function sProblem(lt) {
+  headline('机器人为什么难？', lt);
+  // traditional pipeline
+  const k0 = prog(lt, 0.4, 0.9);
+  text('传统机器人', 120, 440, { size: 28, weight: 700, color: C.dim, alpha: k0 });
+  const steps = ['感知', '定位', '规划', '控制'];
+  steps.forEach((s, i) => {
+    const x = 420 + i * 300, k = eout(prog(lt, 0.6 + i * 0.3, 1.1 + i * 0.3));
+    box(x, 395, 220, 90, { alpha: k });
+    text(s, x + 110, 442, { size: 34, weight: 700, align: 'center', base: 'middle', alpha: k });
+    text('手工设计', x + 110, 515, { size: 20, align: 'center', color: C.dim, alpha: k * 0.9 });
+    if (i < 3) line(x + 230, 440, x + 290, 440, { p: eio(prog(lt, 0.9 + i * 0.3, 1.2 + i * 0.3)), lw: 3 });
+  });
+  // brittleness mark
+  const kx = eback(prog(lt, 3.6, 4.1));
+  if (kx > 0) {
+    ctx.save(); ctx.translate(1030, 395); ctx.scale(kx, kx);
+    ctx.beginPath(); ctx.arc(0, 0, 24, 0, 7); ctx.fillStyle = C.cup; al(1); ctx.fill();
+    ctx.strokeStyle = C.fg; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-9, -9); ctx.lineTo(9, 9); ctx.moveTo(9, -9); ctx.lineTo(-9, 9); ctx.stroke();
+    ctx.restore();
+  }
+  // LLM row
+  const k1 = prog(lt, 5.3, 5.8);
+  text('大语言模型', 120, 700, { size: 28, weight: 700, color: C.dim, alpha: k1 });
+  box(420, 655, 220, 90, { alpha: k1, stroke: C.L });
+  text('LLM', 530, 702, { size: 36, weight: 800, font: LATIN, align: 'center', base: 'middle', color: C.L, alpha: k1 });
+  line(650, 700, 710, 700, { p: eio(prog(lt, 5.8, 6.2)) });
+  const kb = eout(prog(lt, 6.1, 6.6));
+  box(720, 655, 520, 90, { alpha: kb, r: 45 });
+  const typed = '“先拿起杯子，再放到盘子上……”';
+  const n = Math.floor(typed.length * prog(lt, 6.3, 7.6));
+  text(typed.slice(0, n), 750, 702, { size: 28, base: 'middle', alpha: kb });
+  line(1250, 700, 1310, 700, { p: eio(prog(lt, 7.3, 7.6)), color: C.faint });
+  const kq = prog(lt, 7.6, 8.0);
+  box(1320, 655, 220, 90, { alpha: kq, stroke: C.faint, fill: null });
+  text('身体？', 1430, 702, { size: 32, weight: 700, align: 'center', base: 'middle', color: C.dim, alpha: kq });
+  text('只会输出文字', 1330, 780, { size: 20, color: C.dim, alpha: kq });
+  captions(lt, [
+    [0.4, 5.2, '传统机器人：感知、定位、规划、控制，每个模块单独手工设计，换个场景就容易失效'],
+    [5.2, 8.9, '大语言模型懂常识、会推理，却只能输出文字，无法直接控制身体'],
+    [8.9, 11, '能不能用一个模型，从「看到 + 听到」直接到「动手」？'],
+  ]);
+}
+
+// 2 · Overview
+function sOverview(lt) {
+  headline('VLA 是什么？', lt);
+  const kI = eout(prog(lt, 0.4, 1.0));
+  text('视觉 V · 摄像头画面', 140, 385, { size: 24, weight: 700, color: C.V, alpha: kI });
+  world(140, 405, 460, {}, kI);
+  const kL = eout(prog(lt, 1.0, 1.6));
+  text('语言 L · 人的指令', 140, 745, { size: 24, weight: 700, color: C.L, alpha: kL });
+  box(140, 765, 460, 76, { alpha: kL, stroke: C.L, fill: hexA(C.L, 0.12), r: 38 });
+  text('“把红色杯子放到盘子上”', 370, 804, { size: 30, weight: 500, align: 'center', base: 'middle', alpha: kL });
+  // model
+  const kM = eback(prog(lt, 4.0, 4.6));
+  line(620, 540, 760, 590, { p: eio(prog(lt, 3.4, 4.0)), color: C.V, lw: 4 });
+  line(620, 800, 760, 660, { p: eio(prog(lt, 3.4, 4.0)), color: C.L, lw: 4 });
+  if (kM > 0) {
+    ctx.save(); ctx.translate(960, 625); ctx.scale(kM, kM);
+    box(-190, -120, 380, 240, { fill: '#17171F', stroke: C.fg, r: 28, lw: 3 });
+    text('VLA 模型', 0, -12, { size: 52, weight: 900, align: 'center', base: 'middle' });
+    text('一个端到端的大模型', 0, 50, { size: 24, align: 'center', base: 'middle', color: C.dim });
+    ctx.restore();
+  }
+  // output
+  const kO = eout(prog(lt, 7.6, 8.2));
+  line(1160, 625, 1290, 625, { p: eio(prog(lt, 7.2, 7.7)), color: C.A, lw: 4 });
+  text('动作 A · 下一步怎么动', 1310, 540, { size: 24, weight: 700, color: C.A, alpha: kO });
+  for (let i = 0; i < 7; i++) {
+    const k = eback(prog(lt, 7.8 + i * 0.08, 8.2 + i * 0.08));
+    const hgt = 20 + rnd(i + 3) * 70;
+    if (k > 0) { rrect(1310 + i * 64, 690 - hgt * k, 44, hgt * k, 8); ctx.fillStyle = C.A; al(0.9); ctx.fill(); }
+  }
+  text('7 个数字：移动 · 旋转 · 夹爪', 1310, 730, { size: 22, color: C.dim, alpha: kO });
+  // loop back
+  const kp = eio(prog(lt, 9.4, 11.0));
+  poly([[1510, 750], [1510, 900], [90, 900], [90, 540], [128, 540]], { p: kp, color: C.dim, lw: 3 });
+  text('执行 → 看到新画面 → 再决策', 800, 888, { size: 22, color: C.dim, align: 'center', alpha: prog(lt, 10.2, 10.7) });
+  captions(lt, [
+    [0.4, 3.3, '输入两样东西：摄像头看到的画面，和人说的一句指令'],
+    [3.3, 7.1, '一个模型同时理解「看到了什么」和「要做什么」'],
+    [7.1, 9.4, '直接输出机器人下一步的动作'],
+    [9.4, 12, '执行后拍下新画面，再次决策 —— 不断循环，直到完成任务'],
+  ]);
+}
+
+// 3 · Vision encoder
+const GX = 8, GY = 5;
+function sVision(lt) {
+  headline('第一步 · 看：图像 → 视觉 token', lt);
+  const wx = 140, wy = 380, ww = 620, wh = ww * 0.6;
+  const pw = ww / GX, ph = wh / GY;
+  world(wx, wy, ww, {}, prog(lt, 0.3, 0.8));
+  // grid
+  const kg = eio(prog(lt, 1.2, 2.6));
+  ctx.strokeStyle = C.V; ctx.lineWidth = 2;
+  for (let i = 1; i < GX; i++) { al(0.8); ctx.beginPath(); ctx.moveTo(wx + i * pw, wy); ctx.lineTo(wx + i * pw, wy + wh * kg); ctx.stroke(); }
+  for (let j = 1; j < GY; j++) { al(0.8); ctx.beginPath(); ctx.moveTo(wx, wy + j * ph); ctx.lineTo(wx + ww * kg, wy + j * ph); ctx.stroke(); }
+  text('切成 8 × 5 = 40 个小方块', wx, wy + wh + 44, { size: 24, color: C.V, alpha: prog(lt, 2.2, 2.7) });
+  // encoder
+  const ex = 900, ey = 470, ew = 260, eh = 190;
+  const ke = eout(prog(lt, 3.6, 4.2));
+  const recv = Math.max(0, Math.sin(Math.PI * prog(lt, 4.4, 7.4)));
+  box(ex, ey, ew, eh, { alpha: ke, stroke: mix(C.faint, C.V, 0.3 + 0.7 * recv), fill: mix('#13131A', '#123A36', recv * 0.6), r: 20 });
+  text('视觉编码器', ex + ew / 2, ey + 82, { size: 32, weight: 700, align: 'center', base: 'middle', alpha: ke });
+  text('ViT', ex + ew / 2, ey + 128, { size: 22, font: MONO, align: 'center', base: 'middle', color: C.dim, alpha: ke });
+  // patches flying in, tokens coming out
+  const tx0 = 1270, ty0 = 430, ts = 42, tg = 12;
+  for (let i = 0; i < GX * GY; i++) {
+    const c = i % GX, r = Math.floor(i / GX);
+    const t0 = 4.4 + i * 0.065;
+    const f = prog(lt, t0, t0 + 0.55);
+    if (f > 0 && f < 1) {
+      const sx = wx + c * pw, sy = wy + r * ph;
+      const k = eio(f);
+      const x = lerp(sx, ex + ew / 2 - 20, k), y = lerp(sy, ey + eh / 2 - 20, k);
+      const s = lerp(pw, 40, k);
+      box(x, y, s, s * (lerp(ph, 40, k) / s), { fill: hexA(C.V, 0.25), stroke: C.V, r: 6, alpha: 1 - k * 0.6 });
+    }
+    if (f > 0 && f < 0.2) box(wx + c * pw, wy + r * ph, pw, ph, { fill: hexA(C.V, 0.35), stroke: null, r: 0, alpha: 1 });
+    const ko = eback(prog(lt, t0 + 0.6, t0 + 0.95));
+    if (ko > 0) {
+      const x = tx0 + c * (ts + tg), y = ty0 + r * (ts + tg);
+      ctx.save(); ctx.translate(x + ts / 2, y + ts / 2); ctx.scale(ko, ko);
+      sq(-ts / 2, -ts / 2, ts, mix('#0F3F39', C.V, 0.35 + 0.65 * rnd(i * 7)), 1, 8);
+      ctx.restore();
+    }
+  }
+  line(ex + ew + 10, ey + eh / 2, tx0 - 20, ey + eh / 2, { p: eio(prog(lt, 4.8, 5.3)), color: C.V });
+  text('40 个视觉 token', tx0, ty0 + GY * (ts + tg) + 34, { size: 24, color: C.V, alpha: prog(lt, 7.6, 8.1) * (1 - prog(lt, 8.6, 8.9)) });
+  // correspondence: cup patch ↔ token
+  const kc = eout(prog(lt, 8.8, 9.5));
+  if (kc > 0) {
+    const c = 3, r = 3, i = r * GX + c;
+    box(wx + c * pw, wy + r * ph, pw, ph, { fill: null, stroke: C.hi, lw: 4, r: 4, alpha: kc });
+    const x = tx0 + c * (ts + tg), y = ty0 + r * (ts + tg);
+    box(x - 4, y - 4, ts + 8, ts + 8, { fill: null, stroke: C.hi, lw: 4, r: 10, alpha: kc });
+    text('杯子所在的方块  ↔  它对应的 token', tx0, ty0 + GY * (ts + tg) + 34, { size: 24, color: C.hi, alpha: kc });
+    void i;
+  }
+  captions(lt, [
+    [0.3, 3.6, '先把摄像头画面切成许多小方块（patch）'],
+    [3.6, 8.6, '视觉编码器把每个小方块压缩成一个向量'],
+    [8.6, 12, '这就是视觉 token —— 图像的“单词”，每个对应画面里的一块区域'],
+  ]);
+}
+
+// 4 · Language + fusion
+const WORDS = ['把', '红色', '杯子', '放到', '盘子', '上'];
+function sFusion(lt) {
+  headline('第二步 · 读：指令 → 文字 token，一起送进大模型', lt);
+  const ts = 40, tg = 8, nV = 12, HL = 7, HP = 9; // highlighted: cup token, plate token
+  const vW = nV * ts + (nV - 1) * tg;
+  const wws = WORDS.map(w => mw(w, 26, 600) + 32);
+  const tW = wws.reduce((a, b) => a + b, 0) + (WORDS.length - 1) * tg;
+  // positions: separate (top) → merged (center row)
+  const merged = eio(prog(lt, 3.4, 4.8));
+  const vx0 = lerp(140, W / 2 - (vW + 60 + tW) / 2, merged), vy = lerp(470, 610, merged);
+  const tx0 = lerp(1100, W / 2 - (vW + 60 + tW) / 2 + vW + 60, merged), ty = lerp(466, 606, merged);
+  const kl = prog(lt, 0.3, 0.8) * (1 - merged);
+  text('视觉 token（来自上一步）', 140, 440, { size: 24, color: C.V, weight: 700, alpha: kl });
+  text('文字 token', 1100, 440, { size: 24, color: C.L, weight: 700, alpha: kl });
+  const vPos = [];
+  for (let i = 0; i < nV; i++) {
+    const x = vx0 + i * (ts + tg);
+    vPos.push(x + ts / 2);
+    sq(x, vy, ts, mix('#0F3F39', C.V, 0.35 + 0.65 * rnd((i + 20) * 7)), prog(lt, 0.3 + i * 0.03, 0.6 + i * 0.03), 8);
+  }
+  text('…', vx0 + vW + 30, vy + ts / 2 + 2, { size: 30, align: 'center', base: 'middle', color: C.dim, alpha: prog(lt, 0.6, 1) });
+  // instruction splitting
+  const ks = prog(lt, 0.8, 1.2);
+  const split = eio(prog(lt, 1.4, 2.4));
+  const wPos = [];
+  let x = tx0;
+  WORDS.forEach((w, i) => {
+    const xx = x + (1 - split) * (i * -tg);
+    wPos.push(xx + wws[i] / 2);
+    pill(w, xx, ty, { color: C.L, alpha: ks, pad: 16, h: 48, size: 26 });
+    x += wws[i] + tg;
+  });
+  // model block
+  const kb = eout(prog(lt, 4.8, 5.4));
+  const bx = W / 2 - (vW + 60 + tW) / 2 - 40, bw = vW + 60 + tW + 80;
+  box(bx, 700, bw, 150, { alpha: kb, stroke: C.fg, fill: '#17171F', r: 24, lw: 3 });
+  text('预训练的视觉-语言大模型（Transformer）', W / 2, 758, { size: 34, weight: 700, align: 'center', base: 'middle', alpha: kb });
+  text('从互联网图文中学到了物体、语言与常识', W / 2, 810, { size: 22, align: 'center', base: 'middle', color: C.dim, alpha: kb });
+  for (let i = 0; i < nV; i += 2) line(vPos[i], vy + ts + 8, vPos[i], 690, { p: eio(prog(lt, 5.2, 5.7)), color: C.V, lw: 2, alpha: 0.7 });
+  for (let i = 0; i < WORDS.length; i++) line(wPos[i], ty + 56, wPos[i], 690, { p: eio(prog(lt, 5.2, 5.7)), color: C.L, lw: 2, alpha: 0.7 });
+  // grounding arcs
+  const arc = (xa, xb, p, col, lw) => {
+    if (p <= 0) return;
+    const h = 80 + Math.abs(xa - xb) * 0.18, y0 = vy - 8;
+    ctx.beginPath();
+    for (let k = 0; k <= 50; k++) {
+      const s = k / 50 * p, u = 1 - s;
+      const px = u * u * xa + 2 * u * s * (xa + xb) / 2 + s * s * xb;
+      const py = u * u * y0 + 2 * u * s * (y0 - 2 * h) + s * s * y0;
+      k ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.strokeStyle = col; ctx.lineWidth = lw; al(1); ctx.stroke();
+  };
+  const g1 = eio(prog(lt, 6.8, 7.8)), g2 = eio(prog(lt, 7.6, 8.6));
+  arc(wPos[2], vPos[HL], g1, C.hi, 5);
+  arc(wPos[4], vPos[HP], g2, hexA(C.hi, 0.6), 3);
+  if (g1 > 0) {
+    box(vPos[HL] - ts / 2 - 4, vy - 4, ts + 8, ts + 8, { fill: null, stroke: C.hi, lw: 4, r: 10, alpha: g1 });
+    box(wPos[2] - wws[2] / 2 - 4, ty - 4, wws[2] + 8, 56, { fill: null, stroke: C.hi, lw: 4, r: 14, alpha: g1 });
+  }
+  if (g2 > 0) box(vPos[HP] - ts / 2 - 4, vy - 4, ts + 8, ts + 8, { fill: null, stroke: hexA(C.hi, 0.6), lw: 3, r: 10, alpha: g2 });
+  text('注意力：词 ↔ 画面区域', W / 2, 372, { size: 24, color: C.hi, align: 'center', alpha: prog(lt, 7.8, 8.3) });
+  captions(lt, [
+    [0.3, 3.3, '指令同样被切分成一个个文字 token'],
+    [3.3, 6.6, '视觉 token 和文字 token 拼成一条序列，送进预训练的大模型'],
+    [6.6, 10, '注意力让「杯子」「盘子」这些词，对准画面中对应的位置'],
+  ]);
+}
+
+// 5 · Action tokens
+const DIMS = [['Δx', 0.12], ['Δy', -0.05], ['Δz', 0.30], ['Δroll', 0.00], ['Δpitch', 0.02], ['Δyaw', -0.10], ['夹爪', 1.00]];
+const BIN = v => Math.round((v + 1) / 2 * 255);
+function sAction(lt) {
+  headline('第三步 · 做：把动作也变成 token', lt);
+  const sw = 170, sg = 20, sx0 = (W - (7 * sw + 6 * sg)) / 2, sy = 380, sh = 124;
+  const focus = prog(lt, 5.4, 6.0) * (1 - prog(lt, 10.8, 11.4));
+  const tok = eio(prog(lt, 11.2, 12.2));
+  DIMS.forEach(([name, v], i) => {
+    const k = eout(prog(lt, 0.5 + i * 0.12, 1.0 + i * 0.12));
+    const x = sx0 + i * (sw + sg);
+    const dimmed = i === 2 ? 0 : focus * 0.65;
+    const strokeC = i === 2 && focus > 0 ? mix(C.faint, C.hi, focus) : mix(C.faint, C.A, tok);
+    box(x, sy, sw, sh, { alpha: k * (1 - dimmed), stroke: strokeC, fill: mix('#13131A', '#3A2610', tok * 0.8), lw: i === 2 ? 2 + 2 * focus : 2 });
+    text(name, x + sw / 2, sy + 38, { size: 22, font: MONO, align: 'center', base: 'middle', color: C.dim, alpha: k * (1 - dimmed) });
+    const val = (v >= 0 ? '+' : '') + v.toFixed(2);
+    text(val, x + sw / 2, sy + 86, { size: 36, font: MONO, weight: 600, align: 'center', base: 'middle', alpha: k * (1 - dimmed) * (1 - tok) });
+    text(String(BIN(v)), x + sw / 2, sy + 86, { size: 40, font: MONO, weight: 600, align: 'center', base: 'middle', color: C.A, alpha: tok });
+  });
+  const kb = prog(lt, 1.6, 2.2) * (1 - focus) * (1 - tok);
+  const brace = (i0, i1, label) => {
+    const x0 = sx0 + i0 * (sw + sg), x1 = sx0 + i1 * (sw + sg) + sw;
+    line(x0 + 6, sy + sh + 18, x1 - 6, sy + sh + 18, { head: false, color: C.dim, lw: 2, alpha: kb });
+    text(label, (x0 + x1) / 2, sy + sh + 56, { size: 24, align: 'center', color: C.dim, alpha: kb });
+  };
+  brace(0, 2, '位置变化'); brace(3, 5, '姿态变化'); brace(6, 6, '开 / 合');
+  text('token 编号', sx0 + 7 * sw + 6 * sg, sy - 16, { size: 20, color: C.A, align: 'right', alpha: tok });
+  // ruler
+  const rx0 = 360, rx1 = 1560, ry = 720;
+  const kr = prog(lt, 6.0, 6.6) * (1 - prog(lt, 11.2, 11.7));
+  if (kr > 0) {
+    for (let b = 0; b < 256; b++) {
+      const x = rx0 + b / 255 * (rx1 - rx0), major = b % 64 === 0 || b === 255;
+      al(kr * (major ? 0.9 : 0.35)); ctx.fillStyle = C.fg; ctx.fillRect(x - 0.6, ry - (major ? 16 : 8), 1.2, major ? 32 : 16);
+    }
+    al(kr); ctx.fillStyle = C.faint; ctx.fillRect(rx0, ry - 1, rx1 - rx0, 2);
+    [0, 64, 128, 192, 255].forEach(b => text(String(b), rx0 + b / 255 * (rx1 - rx0), ry + 48, { size: 20, font: MONO, align: 'center', color: C.dim, alpha: kr }));
+    text('-1.0', rx0 - 20, ry + 7, { size: 20, font: MONO, align: 'right', color: C.dim, alpha: kr });
+    text('+1.0', rx1 + 20, ry + 7, { size: 20, font: MONO, color: C.dim, alpha: kr });
+    text('数值范围切成 256 格', rx0, ry - 50, { size: 24, color: C.dim, alpha: kr });
+    // marker drops from Δz slot to its bin
+    const b = BIN(0.30), bx = rx0 + b / 255 * (rx1 - rx0);
+    const sxz = sx0 + 2 * (sw + sg) + sw / 2;
+    const kd = eio(prog(lt, 7.2, 8.4));
+    if (kd > 0) {
+      const mx = lerp(sxz, bx, kd), my = lerp(sy + sh + 10, ry, kd);
+      line(sxz, sy + sh + 10, mx, my, { head: false, color: C.hi, lw: 2, alpha: kr * 0.6, dash: [6, 8] });
+      ctx.beginPath(); ctx.arc(mx, my, 9, 0, 7); ctx.fillStyle = C.hi; al(kr); ctx.fill();
+    }
+    const ks = eback(prog(lt, 8.5, 8.9));
+    if (ks > 0) {
+      al(kr); ctx.fillStyle = C.A; ctx.fillRect(bx - 2.5, ry - 30 * ks, 5, 60 * ks);
+      text('0.30 落在第 166 格', bx, ry - 46, { size: 26, weight: 700, align: 'center', color: C.hi, alpha: kr * clamp(ks) });
+    }
+    const kt = eout(prog(lt, 9.4, 9.9));
+    if (kt > 0) {
+      text('→  动作 token', bx - 60, ry + 118, { size: 26, align: 'right', base: 'middle', color: C.dim, alpha: kr * kt });
+      pill('166', bx - 40, ry + 94, { color: C.A, solid: true, font: MONO, size: 28, alpha: kr * kt });
+    }
+  }
+  // output sequence: model "speaks" action tokens one by one
+  const ko = prog(lt, 11.8, 12.3);
+  if (ko > 0) {
+    const y = 700;
+    let x = 380;
+    for (let i = 0; i < 5; i++) sq(x + i * 34, y + 6, 28, mix('#0F3F39', C.V, 0.4 + 0.6 * rnd(i * 5)), ko, 6);
+    x += 5 * 34;
+    text('…', x + 14, y + 22, { size: 26, align: 'center', base: 'middle', color: C.dim, alpha: ko });
+    x += 34;
+    for (let i = 0; i < 3; i++) sq(x + i * 34, y + 6, 28, hexA(C.L, 0.8), ko, 6);
+    x += 3 * 34 + 10;
+    text('图像 + 指令', 380, y - 22, { size: 20, color: C.dim, alpha: ko });
+    line(x, y + 20, x + 60, y + 20, { color: C.dim, alpha: ko, lw: 3 });
+    x += 80;
+    text('模型逐个输出', x, y - 22, { size: 20, color: C.A, alpha: ko });
+    DIMS.forEach(([, v], i) => {
+      const k = eback(prog(lt, 12.6 + i * 0.4, 12.95 + i * 0.4));
+      if (k <= 0) return;
+      ctx.save(); ctx.translate(x + 36, y + 20); ctx.scale(k, k);
+      pill(String(BIN(v)), -36, -22, { color: C.A, solid: true, font: MONO, size: 24, h: 44, pad: 12 });
+      ctx.restore();
+      x += 86;
+    });
+    const kf = eout(prog(lt, 15.6, 16.2));
+    line(x + 6, y + 20, x + 66, y + 20, { p: kf, color: C.A, lw: 3 });
+    text('还原成数值 → 机械臂', x + 84, y + 28, { size: 26, weight: 700, color: C.fg, alpha: kf });
+  }
+  captions(lt, [
+    [0.4, 5.3, '机器人每一步的动作，可以写成 7 个数字：位置变化、姿态变化、夹爪开合'],
+    [5.3, 11.0, '把每个数字的范围切成 256 格，落在第几格，就用这个编号来表示'],
+    [11.0, 17, '于是动作也成了“词”：模型像说话一样逐个输出，再还原成数值控制机械臂'],
+  ]);
+}
+
+// 6 · Continuous actions
+function sChunk(lt) {
+  headline('另一种做法：直接生成连续动作', lt);
+  const y = 470, h = 190;
+  const k1 = eout(prog(lt, 0.3, 0.8));
+  box(140, y, 380, h, { alpha: k1, stroke: C.fg, fill: '#17171F', r: 22 });
+  text('视觉-语言大模型', 330, y + 82, { size: 32, weight: 700, align: 'center', base: 'middle', alpha: k1 });
+  text('理解画面与指令', 330, y + 128, { size: 22, align: 'center', base: 'middle', color: C.dim, alpha: k1 });
+  line(535, y + h / 2, 640, y + h / 2, { p: eio(prog(lt, 0.9, 1.3)) });
+  const k2 = eback(prog(lt, 1.3, 1.8));
+  if (k2 > 0) {
+    ctx.save(); ctx.translate(820, y + h / 2); ctx.scale(k2, k2);
+    box(-170, -h / 2, 340, h, { stroke: C.A, fill: hexA(C.A, 0.1), r: 22, lw: 3 });
+    text('动作专家', 0, -14, { size: 36, weight: 800, align: 'center', base: 'middle', color: C.A });
+    text('扩散 / 流匹配', 0, 38, { size: 22, align: 'center', base: 'middle', color: C.dim });
+    ctx.restore();
+  }
+  line(1000, y + h / 2, 1100, y + h / 2, { p: eio(prog(lt, 2.0, 2.4)), color: C.A });
+  // chart of an action chunk
+  const cx0 = 1130, cx1 = 1780, cy0 = 400, cy1 = 740;
+  const kc = prog(lt, 2.3, 2.8);
+  box(cx0, cy0, cx1 - cx0, cy1 - cy0, { alpha: kc, fill: '#101017' });
+  text('未来 50 步的动作（动作块）', cx0 + 24, cy0 + 44, { size: 24, weight: 700, alpha: kc });
+  const series = [
+    [C.A, s => 0.55 * Math.sin(s * 3.1 + 0.4) * (1 - s * 0.3)],
+    [C.V, s => 0.45 * Math.cos(s * 2.2 + 1.1)],
+    [C.L, s => 0.6 * Math.sin(s * 4.2 + 2) * 0.6],
+  ];
+  const pc = eio(prog(lt, 2.8, 5.0));
+  series.forEach(([col, f], n) => {
+    ctx.beginPath();
+    for (let k = 0; k <= 50 * pc; k++) {
+      const s = k / 50, x = cx0 + 40 + s * (cx1 - cx0 - 80), yy = (cy0 + cy1) / 2 + 30 + f(s) * 110;
+      k ? ctx.lineTo(x, yy) : ctx.moveTo(x, yy);
+    }
+    ctx.strokeStyle = col; ctx.lineWidth = 4; al(kc); ctx.stroke();
+    void n;
+  });
+  // comparison
+  const kk = eout(prog(lt, 5.3, 5.9));
+  text('两种主流路线', 140, 800, { size: 24, color: C.dim, alpha: kk });
+  let x = 140;
+  x += pill('离散动作 token：RT-2、OpenVLA', x, 830, { color: C.dim, alpha: kk, size: 26, h: 54, pad: 22, weight: 500 }) + 24;
+  pill('连续动作块：π0 等', x, 830, { color: C.A, alpha: kk, size: 26, h: 54, pad: 22, weight: 500 });
+  captions(lt, [
+    [0.3, 5.0, '也可以在大模型后面接一个「动作专家」，直接生成连续的数值'],
+    [5.0, 9, '一次预测接下来一小段动作，动作更平滑、控制频率也更高'],
+  ]);
+}
+
+// 7 · Closed loop
+const KF_TASK = [
+  [0.0, 520, 240, 1], [1.8, 400, 340, 1], [3.0, 400, 440, 1], [3.8, 400, 440, 0],
+  [5.2, 400, 330, 0], [7.4, 680, 330, 0], [8.8, 680, 436, 0], [9.6, 680, 436, 1], [11, 680, 300, 1],
+];
+function taskState(T, kf, release) {
+  const st = traj(T, kf);
+  const grab = kf.find(k => k[3] === 0)[0];
+  let cup = [400, 470];
+  if (T >= grab && (release === undefined || T < release)) cup = [st.g[0], st.g[1] + 30];
+  else if (release !== undefined && T >= release) cup = [680, 466];
+  return { ...st, cup };
+}
+function sLoop(lt) {
+  headline('第四步 · 闭环：看 → 想 → 动，不断循环', lt);
+  const T = Math.max(0, lt - 1.0);
+  const st = taskState(T, KF_TASK, 9.6);
+  const done = eout(prog(T, 11.0, 11.6));
+  const wx = 120, wy = 330, ww = 1000;
+  world(wx, wy, ww, {
+    g: st.g, open: st.open, cup: st.cup,
+    extra: () => {
+      if (done <= 0) return;
+      ctx.strokeStyle = C.block; ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.globalAlpha = A * done;
+      ctx.beginPath(); ctx.moveTo(830, 300); ctx.lineTo(860, 330); ctx.lineTo(920, 260); ctx.stroke();
+    },
+  }, prog(lt, 0.2, 0.7));
+  box(wx + ww - 354, wy + 24, 330, 56, { fill: hexA(C.L, 0.18), stroke: C.L, r: 28, alpha: prog(lt, 0.5, 1.0) });
+  text('把红色杯子放到盘子上', wx + ww - 354 + 165, wy + 53, { size: 24, weight: 500, align: 'center', base: 'middle', alpha: prog(lt, 0.5, 1.0) });
+  // loop diagram
+  const cx = 1500, cy = 520, r = 120;
+  const kd = prog(lt, 0.6, 1.2);
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.strokeStyle = C.faint; ctx.lineWidth = 4; al(kd); ctx.stroke();
+  const running = T > 0 && T < 11;
+  const phase = (T % 1.0);
+  const nodes = [['看', C.V, -90], ['想', C.L, 30], ['动', C.A, 150]];
+  const active = Math.floor(phase * 3);
+  if (running) {
+    const ang = (-90 + phase * 360) * Math.PI / 180;
+    ctx.beginPath(); ctx.arc(cx, cy, r, -Math.PI / 2, ang); ctx.strokeStyle = C.fg; ctx.lineWidth = 4; al(0.5); ctx.stroke();
+  }
+  nodes.forEach(([s, col, deg], i) => {
+    const a = deg * Math.PI / 180, x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+    const on = running && i === active;
+    ctx.beginPath(); ctx.arc(x, y, on ? 46 : 40, 0, 7);
+    ctx.fillStyle = on ? col : C.bg; al(kd); ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = col; ctx.stroke();
+    text(s, x, y + 2, { size: 32, weight: 900, align: 'center', base: 'middle', color: on ? C.bg : col, alpha: kd });
+  });
+  const step = Math.min(11, Math.floor(T) + 1);
+  text(`第 ${step} 步`, cx, 740, { size: 40, weight: 800, align: 'center', alpha: kd });
+  // current action tokens readout
+  for (let i = 0; i < 7; i++) {
+    const v = i === 6 ? (st.open > 0.5 ? 255 : 0) : 100 + Math.floor(rnd(step * 13 + i) * 60);
+    const x = 1300 + i * 58;
+    box(x, 790, 50, 40, { fill: hexA(C.A, 0.85), stroke: null, r: 8, alpha: kd });
+    text(String(v), x + 25, 811, { size: 18, font: MONO, weight: 600, align: 'center', base: 'middle', color: C.bg, alpha: kd });
+  }
+  text('本步动作 token', cx, 870, { size: 20, align: 'center', color: C.dim, alpha: kd });
+  captions(lt, [
+    [0.3, 5.2, '每一步：拍下新画面 → 模型推理 → 输出一个小动作'],
+    [5.2, 11.6, '执行后再看，根据新的情况不断修正，一步步推进任务'],
+    [11.6, 15, '任务完成：红色杯子被放到了盘子上（真实系统每秒决策数次到数十次）'],
+  ]);
+}
+
+// 8 · Training
+function sTrain(lt) {
+  headline('怎么训练？两个阶段', lt);
+  const cy = 350, ch = 480, cw = 760;
+  const c1 = 140, c2 = 1020;
+  const k1 = eout(prog(lt, 0.4, 1.0)), k2 = eout(prog(lt, 4.2, 4.8));
+  box(c1, cy, cw, ch, { alpha: k1, r: 24 });
+  text('①  预训练：互联网图文', c1 + 40, cy + 64, { size: 34, weight: 800, alpha: k1 });
+  for (let r = 0; r < 3; r++) {
+    const k = eout(prog(lt, 1.0 + r * 0.3, 1.5 + r * 0.3));
+    const y = cy + 110 + r * 100;
+    box(c1 + 40, y, 120, 80, { fill: '#1B1B25', stroke: null, r: 10, alpha: k });
+    const cols = [C.cup, C.plate, C.block, C.hi];
+    ctx.beginPath(); ctx.arc(c1 + 80, y + 44, 18, 0, 7); ctx.fillStyle = cols[r]; al(k); ctx.fill();
+    sq(c1 + 108, y + 30, 32, cols[(r + 2) % 4], k, 4);
+    box(c1 + 190, y + 18, 380 - r * 60, 14, { fill: hexA(C.L, 0.5), stroke: null, r: 7, alpha: k });
+    box(c1 + 190, y + 48, 260 + r * 40, 14, { fill: hexA(C.L, 0.3), stroke: null, r: 7, alpha: k });
+  }
+  text('学到：认识物体 · 理解语言 · 常识', c1 + 40, cy + ch - 44, { size: 26, weight: 600, color: C.V, alpha: prog(lt, 2.4, 2.9) });
+  line(c1 + cw + 20, cy + ch / 2, c2 - 20, cy + ch / 2, { p: eio(prog(lt, 3.8, 4.3)), color: C.fg });
+  box(c2, cy, cw, ch, { alpha: k2, r: 24, stroke: C.A });
+  text('②  微调：机器人示范数据', c2 + 40, cy + 64, { size: 34, weight: 800, alpha: k2 });
+  const demo = [[400, 340, 1], [400, 440, 0], [680, 330, 0]];
+  demo.forEach(([gx, gy, op], r) => {
+    const k = eout(prog(lt, 4.8 + r * 0.3, 5.3 + r * 0.3));
+    const y = cy + 110 + r * 100;
+    const cup = op === 0 ? [gx, gy + 30] : [400, 470];
+    world(c2 + 40, y, 134, { g: [gx, gy], open: op, cup }, k);
+    pill('指令', c2 + 200, y + 16, { color: C.L, alpha: k, size: 22, h: 46 });
+    for (let i = 0; i < 5; i++) sq(c2 + 320 + i * 44, y + 20, 36, C.A, k * (0.5 + 0.5 * rnd(r * 9 + i)), 7);
+    text('正确动作', c2 + 560, y + 50, { size: 20, color: C.dim, alpha: k });
+  });
+  text('来自人类遥控机器人的示范：画面 + 指令 + 动作', c2 + 40, cy + ch - 44, { size: 24, weight: 600, color: C.A, alpha: prog(lt, 6.2, 6.7) });
+  const kf = eout(prog(lt, 8.4, 9.0));
+  text('训练目标：P( 下一个动作 token | 图像, 指令 )', W / 2, 910 + (1 - kf) * 12, { size: 32, font: MONO, weight: 600, align: 'center', alpha: kf });
+  captions(lt, [
+    [0.4, 4.2, '先用海量互联网图文，让模型具备视觉理解、语言能力和常识'],
+    [4.2, 8.3, '再用人类遥控机器人的示范数据微调：画面 + 指令 + 正确动作'],
+    [8.3, 12, '目标和语言模型一样简单：像预测下一个词那样，预测下一个动作'],
+  ]);
+}
+
+// 9 · Generalization
+const KF_PICK = [[0, 520, 240, 1], [1.4, 400, 340, 1], [2.4, 400, 440, 1], [3.0, 400, 440, 0], [4.2, 400, 330, 0]];
+function sGeneral(lt) {
+  headline('为什么强大？会举一反三', lt);
+  const T = Math.max(0, lt - 3.6);
+  const st = taskState(T, KF_PICK);
+  world(140, 360, 820, { g: st.g, open: st.open, cup: st.cup }, prog(lt, 0.2, 0.7));
+  const kq = eout(prog(lt, 0.6, 1.2));
+  box(1060, 380, 720, 110, { alpha: kq, stroke: C.L, fill: hexA(C.L, 0.12), r: 55 });
+  text('“把能装水的东西拿起来”', 1420, 437, { size: 40, weight: 700, align: 'center', base: 'middle', alpha: kq });
+  text('机器人示范数据里从没出现过这句话', 1420, 540, { size: 24, align: 'center', color: C.dim, alpha: prog(lt, 1.4, 1.9) });
+  const kr = eout(prog(lt, 2.4, 3.0));
+  let x = 1150;
+  x += pill('能装水', x, 600, { color: C.L, alpha: kr, size: 30, h: 60, pad: 22 }) + 20;
+  line(x, 630, x + 70, 630, { p: eio(prog(lt, 2.8, 3.2)), color: C.fg });
+  pill('杯子', x + 90, 600, { color: C.cup, alpha: prog(lt, 3.1, 3.5), size: 30, h: 60, pad: 22 });
+  text('常识来自预训练的大模型', 1150, 720, { size: 24, color: C.V, alpha: prog(lt, 3.4, 3.9) });
+  // highlight ring on the cup
+  const kh = eout(prog(lt, 3.2, 3.8));
+  if (kh > 0) {
+    const s = 820 / 1000;
+    const [cx, cyb] = st.cup;
+    ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.arc(140 + cx * s, 360 + (cyb - 45) * s, 70 * s + (1 - kh) * 30, 0, 7);
+    ctx.strokeStyle = C.hi; ctx.lineWidth = 4; al(kh * (1 - prog(lt, 7, 7.6))); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  captions(lt, [
+    [0.4, 4.4, '面对没见过的说法，也能理解并执行'],
+    [4.4, 9, '因为“能装水的东西 = 杯子”这类常识，来自预训练的大模型'],
+  ]);
+}
+
+// 10 · Summary
+function sEnd(lt) {
+  const items = [['看', 'Vision', C.V], ['读', 'Language', C.L], ['做', 'Action', C.A]];
+  const gap = 360, x0 = W / 2 - gap;
+  items.forEach(([zh, en, col], i) => {
+    const x = x0 + i * gap, k = eback(prog(lt, 0.2 + i * 0.3, 0.7 + i * 0.3));
+    if (k > 0) {
+      ctx.save(); ctx.translate(x, 450); ctx.scale(k, k);
+      ctx.beginPath(); ctx.arc(0, 0, 100, 0, 7); ctx.fillStyle = hexA(col, 0.14); al(1); ctx.fill();
+      ctx.lineWidth = 4; ctx.strokeStyle = col; ctx.stroke();
+      text(zh, 0, 6, { size: 96, weight: 900, align: 'center', base: 'middle', color: col });
+      ctx.restore();
+    }
+    text(en, x, 600, { size: 24, font: MONO, align: 'center', color: C.dim, ls: 3, alpha: prog(lt, 0.5 + i * 0.3, 0.9 + i * 0.3) });
+    if (i < 2) text(i === 0 ? '+' : '→', x + gap / 2, 460, { size: 64, weight: 300, align: 'center', base: 'middle', color: C.dim, alpha: prog(lt, 0.6 + i * 0.3, 1 + i * 0.3) });
+  });
+  const k = eout(prog(lt, 1.6, 2.3));
+  text('一个端到端模型：把大模型的理解力，接到机器人的身体上', W / 2, 740 + (1 - k) * 16, { size: 44, weight: 700, align: 'center', alpha: k });
+  text('VLA · Vision-Language-Action', W / 2, 810, { size: 24, font: MONO, align: 'center', color: C.dim, ls: 4, alpha: prog(lt, 2.4, 3) });
+}
+
+const SCENES = [
+  { s: 0, e: 6, f: sTitle, ch: '' },
+  { s: 6, e: 17, f: sProblem, ch: 'PROBLEM' },
+  { s: 17, e: 29, f: sOverview, ch: 'OVERVIEW' },
+  { s: 29, e: 41, f: sVision, ch: '01 · VISION' },
+  { s: 41, e: 51, f: sFusion, ch: '02 · LANGUAGE' },
+  { s: 51, e: 68, f: sAction, ch: '03 · ACTION' },
+  { s: 68, e: 77, f: sChunk, ch: '03 · ACTION CHUNK' },
+  { s: 77, e: 92, f: sLoop, ch: '04 · CLOSED LOOP' },
+  { s: 92, e: 104, f: sTrain, ch: 'TRAINING' },
+  { s: 104, e: 113, f: sGeneral, ch: 'GENERALIZATION' },
+  { s: 113, e: 120, f: sEnd, ch: 'SUMMARY' },
+];
+
+function render(t) {
+  ctx.globalAlpha = 1;
+  ctx.drawImage(bgc, 0, 0);
+  for (let n = 0; n < SCENES.length; n++) {
+    const sc = SCENES[n];
+    const first = n === 0, last = n === SCENES.length - 1;
+    const aIn = first ? 1 : prog(t, sc.s - 0.15, sc.s + 0.45);
+    const aOut = last ? 1 - prog(t, DURATION - 0.8, DURATION - 0.05) : 1 - prog(t, sc.e - 0.45, sc.e + 0.15);
+    A = Math.min(aIn, aOut);
+    if (A <= 0) continue;
+    ctx.save();
+    sc.f(t - sc.s, sc.e - sc.s);
+    ctx.restore();
+    if (sc.ch) text(sc.ch, 120, 110, { size: 20, font: MONO, weight: 600, color: C.A, ls: 4 });
+  }
+  A = 1 - prog(t, DURATION - 0.8, DURATION - 0.05);
+  text('VLA / 2 MIN', W - 120, 110, { size: 18, font: MONO, color: C.dim, align: 'right', ls: 4, alpha: prog(t, 5.6, 6.2) });
+  al(0.8); ctx.fillStyle = C.line; ctx.fillRect(120, 1036, W - 240, 3);
+  al(1); ctx.fillStyle = C.A; ctx.fillRect(120, 1036, (W - 240) * (t / DURATION), 3);
+  ctx.globalAlpha = 1;
+}
+
+// Preload every glyph subset we draw, then mark ready.
+window.ready = (async () => {
+  for (let t = 0; t <= DURATION; t += 0.1) render(t);
+  const all = [...seen].join('');
+  await document.fonts.ready;
+  const specs = [];
+  for (const w of [300, 400, 500, 600, 700, 800, 900]) specs.push(`${w} 40px "Noto Sans SC"`, `${w} 40px "Inter"`);
+  specs.push('400 40px "JetBrains Mono"', '600 40px "JetBrains Mono"');
+  await Promise.all(specs.map(s => document.fonts.load(s, all).catch(() => {})));
+  await document.fonts.ready;
+  render(0);
+  return true;
+})();
+window.render = render;
+
+// Live preview when opened in a browser (not while rendering frames).
+if (!navigator.webdriver) {
+  window.ready.then(() => {
+    const t0 = performance.now();
+    const loop = () => { render(((performance.now() - t0) / 1000) % DURATION); requestAnimationFrame(loop); };
+    loop();
+  });
+  const fit = () => { const s = Math.min(innerWidth / W, innerHeight / H); cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px'; };
+  addEventListener('resize', fit); fit();
+}
+</script>
+</body>
+</html>
